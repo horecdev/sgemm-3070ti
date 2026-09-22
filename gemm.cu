@@ -22,7 +22,7 @@ __global__ void sgemm_naive(int M, int K, int N, float* p_A, float* p_B, float* 
     }
 }
 
-#define TILE_SIZE 16 // must be known at compile time 
+#define TILE_SIZE 32 // must be known at compile time 
 // launches one thread for every output elem in C just like naive
 
 // logically explaining. To calculate a 16x16 patch of C, the block needs a horizontal stripe of A (16 rows tall, 1024 cols wide)
@@ -145,7 +145,7 @@ int main() {
     cudaMemcpy(gpu_A, host_A, bytes_A, cudaMemcpyHostToDevice);
     cudaMemcpy(gpu_B, host_B, bytes_B, cudaMemcpyHostToDevice);
 
-    dim3 threads_per_block(16, 16);
+    dim3 threads_per_block(TILE_SIZE, TILE_SIZE);
     // x is horizontal, y is vertical. thats why M, N maps to Y, 
     // also we launch one block for one element in the result matrix, so row is M, col is N
     dim3 num_blocks((N + threads_per_block.x - 1) / threads_per_block.x, (M + threads_per_block.y - 1) / threads_per_block.y);
