@@ -22,54 +22,86 @@ __global__ void sgemm_naive(int M, int K, int N, float* p_A, float* p_B, float* 
     }
 }
 
-#define TILE_SIZE 32 // must be known at compile time 
-// launches one thread for every output elem in C just like naive
-
-// logically explaining. To calculate a 16x16 patch of C, the block needs a horizontal stripe of A (16 rows tall, 1024 cols wide)
-// and a vertical stripe of B (1024 rows tall, 16 cols wide)
+#define TILE_SIZE 32 // must be known at compile 
+#define THREAD_ROWS 4
+#define THREAD_COLS 4
+// launches one thread for [THREAD_ROW, THREAD_COL] patch of output
+// (TILE_SIZE * TILE_SIZE) / (THREAD_ROWS * THREAD_COLS) threads per patch
+#define THREADS_PER_TILE = (TILE_SIZE * TILE_SIZE) / (THREAD_ROWS * THREAD_COLS)
 
 // the big ass 16x1024 or 1024x16 is chopped into 16x16 tiles that are sliding across K (since to calculate elems you go over whole K)
 __global__ void sgemm_tiled(int M, int K, int N, float* p_A, float* p_B, float* p_C) {
     __shared__ float tile_A[TILE_SIZE][TILE_SIZE];
     __shared__ float tile_B[TILE_SIZE][TILE_SIZE];
 
-    int row = blockIdx.y * TILE_SIZE + threadIdx.y;
-    int col = blockIdx.x * TILE_SIZE + threadIdx.x;
-
-    float sum = 0.0f; // one for each thread
+    float C_reg[THREAD_ROWS][THREAD_COLS] = {0.0f};
 
     int total_phases = (K + TILE_SIZE - 1) / TILE_SIZE; // round it up
     for (int phase = 0; phase < total_phases; ++phase) {
-        if (row < M && (phase * TILE_SIZE + threadIdx.x) < K) { // didnt go off bounds and viable to slide
-            tile_A[threadIdx.y][threadIdx.x] = p_A[row * K + (phase * TILE_SIZE + threadIdx.x)];
-        }
-        else {
-            tile_A[threadIdx.y][threadIdx.x] = 0.0f; // got off bounds (tile OR row)
-            // you can set to 0.0f because later you multiply with respective piece from B (also went off bounds, cuz its both K) and 0 * 0 = 0 in sum accum. 
-            // There is no difference.
-        }
+        // u got 32*32 elems to load across threads. There are (TILE_SIZE * TILE_SIZE) / (THREAD_ROWS * THREAD_COLS) threads. Can just load in a straight line
+        int flat_tid = threadIdx.y * blockDim.x + threadIdx.x;
+        for (int elem_idx = flat_tid; elem_idx < TILE_SIZE * TILE_SIZE; elem_idx += THREADS_PER_TILE) {
+            int tile_row = elem_idx >> 5; // same as / for powers of 2
+            int tile_col = elem_idx & 31; // same as %
 
-        if ((phase * TILE_SIZE + threadIdx.y) < K && col < N) { // same bounds (tile OR col)
-            tile_B[threadIdx.y][threadIdx.x] = p_B[(phase * TILE_SIZE + threadIdx.y) * N + col];
-        }
-        else {
-            tile_B[threadIdx.y][threadIdx.x] = 0.0f;
-        }
+            int global_row_A = blockIdx.y * TILE_SIZE + tile_row;
+            int global_col_A = phase * TILE_SIZE + tile_col;
 
+            if (global_row_A < M && global_col_A < K) {
+                tile_A[tile_row][tile_col] = p_A[global_row_A * K + global_col_A];
+            }
+            else {
+                tile_A[tile_row][tile_col] = 0.0f;
+            }
+
+            int global_row_B = phase * TILE_SIZE + tile_row;
+            int global_col_B = blockIdx.x * TILE_SIZE + tile_col;
+
+            if (global_row_B < K && global_col_B < N) {
+                tile_B[tile_row][tile_col] = p_B[global_row_B * N + global_col_B];
+            }
+            else {
+                tile_B[tile_row][tile_col] = 0.0f;
+            }
+        }
+        // now a and b are loaded up. TODO: tiled register and k loop
         __syncthreads(); // so its all filled up
 
-        // now you REUSE numbers that OTHER THREADS loaded up to tiles.
-        // load from A across K horizontal, from B across K vertical
-        for (int i = 0; i < TILE_SIZE; ++i) {
-            sum += tile_A[threadIdx.y][i] * tile_B[i][threadIdx.x];
+        float A_reg[THREAD_ROWS];
+        float B_reg[THREAD_COLS];
+        
+
+        for (int k = 0; k < TILE_SIZE; ++k) {
+            // TODO: load A reg, load B reg, dot product accumulate
+            for (int i = 0; i < THREAD_ROWS; ++i) {
+                A_reg[i] = tile_A[threadIdx.y * THREAD_ROWS + i][k];
+            }
+            for (int j = 0; j < THREAD_COLS; ++j) {
+                B_reg[j] = tile_B[k][threadIdx.x * THREAD_COLS + j];
+            }
+            for (int i = 0; i < THREAD_ROWS; ++i) {
+                for (int j = 0; j < THREAD_COLS; ++j) {
+                    C_reg[i][j] += A_reg[i] * B_reg[j];
+                }
+            }
         }
 
         // must sync bc some threads may finish faster and overwrite shared memory
         __syncthreads();
     }
+    
+    int start_global_row_C = blockIdx.y * TILE_SIZE + threadIdx.y * THREAD_ROWS;
+    int start_global_col_C = blockIdx.x * TILE_SIZE + threadIdx.x * THREAD_COLS;
 
-    if (row < M && col < N) {
-        p_C[row * N + col] = sum;
+    for (int i = 0; i < THREAD_ROWS; i++) {
+        for (int j = 0; j < THREAD_COLS; j++) {
+            int global_row = start_global_row_C + i;
+            int global_col = start_global_col_C + j;
+
+            if (global_row < M && global_col < N) {
+                p_C[global_row * N + global_col] = C_reg[i][j];
+            }
+        }
     }
 }
 
@@ -145,10 +177,8 @@ int main() {
     cudaMemcpy(gpu_A, host_A, bytes_A, cudaMemcpyHostToDevice);
     cudaMemcpy(gpu_B, host_B, bytes_B, cudaMemcpyHostToDevice);
 
-    dim3 threads_per_block(TILE_SIZE, TILE_SIZE);
-    // x is horizontal, y is vertical. thats why M, N maps to Y, 
-    // also we launch one block for one element in the result matrix, so row is M, col is N
-    dim3 num_blocks((N + threads_per_block.x - 1) / threads_per_block.x, (M + threads_per_block.y - 1) / threads_per_block.y);
+    dim3 threads_per_block(TILE_SIZE / THREAD_COLS, TILE_SIZE / THREAD_ROWS);
+    dim3 num_blocks((N + TILE_SIZE - 1) / TILE_SIZE, (M + TILE_SIZE - 1) / TILE_SIZE);
 
     // prep for benchmarking
     cudaEvent_t start, stop;
