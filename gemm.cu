@@ -3,6 +3,7 @@
 #include <cuda_runtime_api.h>
 #include <device_launch_parameters.h>
 #include <cublas_v2.h>
+#include <driver_types.h>
 #include <iostream>
 #include <stdexcept>
 #include <cstdlib>
@@ -28,14 +29,15 @@ __global__ void sgemm_naive(int M, int K, int N, float* p_A, float* p_B, float* 
 #define THREAD_ROWS 8
 #define THREAD_COLS 8
 #define VECTORIZED_LOAD 4
+
 // launches one thread for [THREAD_ROW, THREAD_COL] patch of output
 // (TILE_SIZE * TILE_SIZE) / (THREAD_ROWS * THREAD_COLS) threads per patch
 #define THREADS_PER_TILE (TILE_ROWS * TILE_COLS) / (THREAD_ROWS * THREAD_COLS)
 
 // the big ass 16x1024 or 1024x16 is chopped into 16x16 tiles that are sliding across K (since to calculate elems you go over whole K)
 __global__ void sgemm_tiled(int M, int K, int N, float* p_A, float* p_B, float* p_C) {
-    __shared__ float tile_A[TILE_ROWS][K_DEPTH];
-    __shared__ float tile_B[K_DEPTH][TILE_COLS];
+    __shared__ __align__(16) float tile_A[K_DEPTH][TILE_ROWS]; // tile_A is stored transposed.
+    __shared__ __align__(16) float tile_B[K_DEPTH][TILE_COLS];
 
     float C_reg[THREAD_ROWS][THREAD_COLS] = {0.0f};
 
@@ -53,8 +55,6 @@ __global__ void sgemm_tiled(int M, int K, int N, float* p_A, float* p_B, float* 
     for (int phase = 0; phase < total_phases; ++phase) {
 
         // LOAD A
-
-        
         for (int load_idx = flat_tid; load_idx < num_loads_A; load_idx += THREADS_PER_TILE) {
             int start_elem_idx = load_idx * VECTORIZED_LOAD;
             int local_row = start_elem_idx / K_DEPTH;
@@ -65,16 +65,16 @@ __global__ void sgemm_tiled(int M, int K, int N, float* p_A, float* p_B, float* 
 
             if (global_row_A < M && global_col_A < K) {
                 float4 chunk_A = reinterpret_cast<float4*>(&p_A[global_row_A * K + global_col_A])[0];
-                tile_A[local_row][local_col + 0] = chunk_A.x;
-                tile_A[local_row][local_col + 1] = chunk_A.y;
-                tile_A[local_row][local_col + 2] = chunk_A.z;
-                tile_A[local_row][local_col + 3] = chunk_A.w;
+                tile_A[local_col + 0][local_row] = chunk_A.x;
+                tile_A[local_col + 1][local_row] = chunk_A.y;
+                tile_A[local_col + 2][local_row] = chunk_A.z;
+                tile_A[local_col + 3][local_row] = chunk_A.w;
             }
             else {
-                tile_A[local_row][local_col + 0] = 0.0f;
-                tile_A[local_row][local_col + 1] = 0.0f;
-                tile_A[local_row][local_col + 2] = 0.0f;
-                tile_A[local_row][local_col + 3] = 0.0f;
+                tile_A[local_col + 0][local_row] = 0.0f;
+                tile_A[local_col + 1][local_row] = 0.0f;
+                tile_A[local_col + 2][local_row] = 0.0f;
+                tile_A[local_col + 3][local_row] = 0.0f;
             }
         }
 
@@ -108,11 +108,20 @@ __global__ void sgemm_tiled(int M, int K, int N, float* p_A, float* p_B, float* 
         float B_reg[THREAD_COLS];
         
         for (int k = 0; k < K_DEPTH; ++k) {
-            for (int i = 0; i < THREAD_ROWS; ++i) {
-                A_reg[i] = tile_A[threadIdx.y * THREAD_ROWS + i][k];
+            for (int load_idx_A = 0; load_idx_A < THREAD_ROWS / VECTORIZED_LOAD; ++load_idx_A) {
+                // tile_A IS TRANSPOSED SO IN REALITY WE ARE ACCESSING tile_A[smth][k]
+                float4 chunk_A = reinterpret_cast<float4*>(&tile_A[k][threadIdx.y * THREAD_ROWS + load_idx_A * VECTORIZED_LOAD])[0];
+                A_reg[load_idx_A * VECTORIZED_LOAD + 0] = chunk_A.x;
+                A_reg[load_idx_A * VECTORIZED_LOAD + 1] = chunk_A.y;
+                A_reg[load_idx_A * VECTORIZED_LOAD + 2] = chunk_A.z;
+                A_reg[load_idx_A * VECTORIZED_LOAD + 3] = chunk_A.w;
             }
-            for (int j = 0; j < THREAD_COLS; ++j) {
-                B_reg[j] = tile_B[k][(threadIdx.x * THREAD_COLS + j)];
+            for (int load_idx_B = 0; load_idx_B < THREAD_COLS / VECTORIZED_LOAD; ++load_idx_B) {
+                float4 chunk_B = reinterpret_cast<float4*>(&tile_B[k][threadIdx.x * THREAD_COLS + load_idx_B * VECTORIZED_LOAD])[0];
+                B_reg[load_idx_B * VECTORIZED_LOAD + 0] = chunk_B.x;
+                B_reg[load_idx_B * VECTORIZED_LOAD + 1] = chunk_B.y;
+                B_reg[load_idx_B * VECTORIZED_LOAD + 2] = chunk_B.z;
+                B_reg[load_idx_B * VECTORIZED_LOAD + 3] = chunk_B.w;
             }
             for (int i = 0; i < THREAD_ROWS; ++i) {
                 for (int j = 0; j < THREAD_COLS; ++j) {
