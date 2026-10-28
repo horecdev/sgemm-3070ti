@@ -25,7 +25,7 @@ __global__ void sgemm_naive(int M, int K, int N, float* p_A, float* p_B, float* 
 
 #define TILE_ROWS 128
 #define TILE_COLS 128
-#define K_DEPTH 8
+#define K_DEPTH 16
 #define THREAD_ROWS 8
 #define THREAD_COLS 8
 #define VECTORIZED_LOAD 4
@@ -49,8 +49,6 @@ __global__ void sgemm_tiled(int M, int K, int N, float* p_A, float* p_B, float* 
     int num_loads_B = K_DEPTH * TILE_COLS / VECTORIZED_LOAD;
     int loads_per_row_B = TILE_COLS / VECTORIZED_LOAD;
 
-    // TODO: load tile A and tile B, multiplication is already correct.
-
     int total_phases = (K + K_DEPTH - 1) / K_DEPTH; // round it up
     for (int phase = 0; phase < total_phases; ++phase) {
 
@@ -64,6 +62,7 @@ __global__ void sgemm_tiled(int M, int K, int N, float* p_A, float* p_B, float* 
             int global_col_A = phase * K_DEPTH + local_col;
 
             if (global_row_A < M && global_col_A < K) {
+                // cannot vectorize this load - its different rows, no stride of 1.
                 float4 chunk_A = reinterpret_cast<float4*>(&p_A[global_row_A * K + global_col_A])[0];
                 tile_A[local_col + 0][local_row] = chunk_A.x;
                 tile_A[local_col + 1][local_row] = chunk_A.y;
@@ -90,16 +89,13 @@ __global__ void sgemm_tiled(int M, int K, int N, float* p_A, float* p_B, float* 
 
             if (global_row_B < K && global_col_B < N) {
                 float4 chunk_B = reinterpret_cast<float4*>(&p_B[global_row_B * N + global_col_B])[0];
-                tile_B[local_row][local_col + 0] = chunk_B.x;
-                tile_B[local_row][local_col + 1] = chunk_B.y;
-                tile_B[local_row][local_col + 2] = chunk_B.z;
-                tile_B[local_row][local_col + 3] = chunk_B.w;
+                reinterpret_cast<float4*>(&tile_B[local_row][local_col])[0] = chunk_B;
+                // its faster than unloading chunks one coord by one, because doing (smth) = chunk.x introduces 4-way bank conflict. 
+                // then .y, .z, .w too. float4 loads/saves are executed 8 lanes at a time
+                // in reality it didn't really save time. U could just load tile_B[local_row][local_col + 0] = chunk.x, so on.
             }
             else {
-                tile_B[local_row][local_col + 0] = 0.0f;
-                tile_B[local_row][local_col + 1] = 0.0f;
-                tile_B[local_row][local_col + 2] = 0.0f;
-                tile_B[local_row][local_col + 3] = 0.0f;
+                reinterpret_cast<float4*>(&tile_B[local_row][local_col])[0] = make_float4(0, 0, 0, 0);
             }
         }
         __syncthreads(); // so its all filled up
@@ -158,8 +154,6 @@ __global__ void sgemm_tiled(int M, int K, int N, float* p_A, float* p_B, float* 
 // [      [   ]  ]       [[   ][   ][   ]]       [       [     ]  ]
 // [             ]       [               ]       [       [  3  ]  ]
 // [             ]       [               ]       [       [     ]  ]
-// this is so brilliant, because one thread used to load K times from A and K times from B.
-// now it loads once per tile for A and B. Thats K / TILE_SIZE reads from VRAM. TILE_SIZE TIMES LESS.
 
 
 void print_upper_left_square(float* p_matrix, int M, int N, int side_length) {
