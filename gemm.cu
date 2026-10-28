@@ -22,12 +22,13 @@ __global__ void sgemm_naive(int M, int K, int N, float* p_A, float* p_B, float* 
     }
 }
 
-#define TILE_SIZE 32 // must be known at compile 
+#define TILE_SIZE 64 // must be known at compile 
 #define THREAD_ROWS 4
 #define THREAD_COLS 4
+#define VECTORIZED_LOAD 4
 // launches one thread for [THREAD_ROW, THREAD_COL] patch of output
 // (TILE_SIZE * TILE_SIZE) / (THREAD_ROWS * THREAD_COLS) threads per patch
-#define THREADS_PER_TILE = (TILE_SIZE * TILE_SIZE) / (THREAD_ROWS * THREAD_COLS)
+#define THREADS_PER_TILE (TILE_SIZE * TILE_SIZE) / (THREAD_ROWS * THREAD_COLS)
 
 // the big ass 16x1024 or 1024x16 is chopped into 16x16 tiles that are sliding across K (since to calculate elems you go over whole K)
 __global__ void sgemm_tiled(int M, int K, int N, float* p_A, float* p_B, float* p_C) {
@@ -38,30 +39,50 @@ __global__ void sgemm_tiled(int M, int K, int N, float* p_A, float* p_B, float* 
 
     int total_phases = (K + TILE_SIZE - 1) / TILE_SIZE; // round it up
     for (int phase = 0; phase < total_phases; ++phase) {
-        // u got 32*32 elems to load across threads. There are (TILE_SIZE * TILE_SIZE) / (THREAD_ROWS * THREAD_COLS) threads. Can just load in a straight line
         int flat_tid = threadIdx.y * blockDim.x + threadIdx.x;
-        for (int elem_idx = flat_tid; elem_idx < TILE_SIZE * TILE_SIZE; elem_idx += THREADS_PER_TILE) {
-            int tile_row = elem_idx >> 5; // same as / for powers of 2
-            int tile_col = elem_idx & 31; // same as %
+        // load_idx is how many loads we perform - so elems divided by load size
+        // TILE SIZE MUST BE A MULTIPLE OF VECTORIZED_LOAD
+        for (int load_idx = flat_tid; load_idx < (TILE_SIZE * TILE_SIZE) / VECTORIZED_LOAD; load_idx += THREADS_PER_TILE) {
+            int start_elem_idx = load_idx * 4;
+            int tile_row = start_elem_idx / TILE_SIZE; // will get optimized to >>
+            int tile_col = start_elem_idx % TILE_SIZE; // will get optimized to &
 
             int global_row_A = blockIdx.y * TILE_SIZE + tile_row;
             int global_col_A = phase * TILE_SIZE + tile_col;
 
+            // when u use xor swizzling on [A][B] u just do [A][B ^ A] everywhere
             if (global_row_A < M && global_col_A < K) {
-                tile_A[tile_row][tile_col] = p_A[global_row_A * K + global_col_A];
+                // reinterpret as 4 float4 pieces, and take the first one [0]
+                float4 chunk_A = reinterpret_cast<float4*>(&p_A[global_row_A * K + global_col_A])[0];
+                tile_A[tile_row][(tile_col + 0) ^ tile_row] = chunk_A.x;
+                tile_A[tile_row][(tile_col + 1) ^ tile_row] = chunk_A.y;
+                tile_A[tile_row][(tile_col + 2) ^ tile_row] = chunk_A.z;
+                tile_A[tile_row][(tile_col + 3) ^ tile_row] = chunk_A.w;
             }
             else {
-                tile_A[tile_row][tile_col] = 0.0f;
+                // if TILE_SIZE sticks out of M, N or K by not a multiple of 4, the result is wrong. So 32x32 tile on 33x33 matrix wont work.
+                tile_A[tile_row][(tile_col + 0) ^ tile_row] = 0.0f;
+                tile_A[tile_row][(tile_col + 1) ^ tile_row] = 0.0f;
+                tile_A[tile_row][(tile_col + 2) ^ tile_row] = 0.0f;
+                tile_A[tile_row][(tile_col + 3) ^ tile_row] = 0.0f;
             }
 
             int global_row_B = phase * TILE_SIZE + tile_row;
             int global_col_B = blockIdx.x * TILE_SIZE + tile_col;
 
             if (global_row_B < K && global_col_B < N) {
-                tile_B[tile_row][tile_col] = p_B[global_row_B * N + global_col_B];
+                float4 chunk_B = reinterpret_cast<float4*>(&p_B[global_row_B * N + global_col_B])[0];
+                tile_B[tile_row][(tile_col + 0) ^ tile_row] = chunk_B.x;
+                tile_B[tile_row][(tile_col + 1) ^ tile_row] = chunk_B.y;
+                tile_B[tile_row][(tile_col + 2) ^ tile_row] = chunk_B.z;
+                tile_B[tile_row][(tile_col + 3) ^ tile_row] = chunk_B.w;
             }
             else {
-                tile_B[tile_row][tile_col] = 0.0f;
+                // same as A case
+                tile_B[tile_row][(tile_col + 0) ^ tile_row] = 0.0f;
+                tile_B[tile_row][(tile_col + 1) ^ tile_row] = 0.0f;
+                tile_B[tile_row][(tile_col + 2) ^ tile_row] = 0.0f;
+                tile_B[tile_row][(tile_col + 3) ^ tile_row] = 0.0f;
             }
         }
         // now a and b are loaded up. TODO: tiled register and k loop
@@ -72,12 +93,11 @@ __global__ void sgemm_tiled(int M, int K, int N, float* p_A, float* p_B, float* 
         
 
         for (int k = 0; k < TILE_SIZE; ++k) {
-            // TODO: load A reg, load B reg, dot product accumulate
             for (int i = 0; i < THREAD_ROWS; ++i) {
-                A_reg[i] = tile_A[threadIdx.y * THREAD_ROWS + i][k];
+                A_reg[i] = tile_A[threadIdx.y * THREAD_ROWS + i][k ^ (threadIdx.y * THREAD_ROWS + i)];
             }
             for (int j = 0; j < THREAD_COLS; ++j) {
-                B_reg[j] = tile_B[k][threadIdx.x * THREAD_COLS + j];
+                B_reg[j] = tile_B[k][(threadIdx.x * THREAD_COLS + j) ^ k];
             }
             for (int i = 0; i < THREAD_ROWS; ++i) {
                 for (int j = 0; j < THREAD_COLS; ++j) {
@@ -177,8 +197,11 @@ int main() {
     cudaMemcpy(gpu_A, host_A, bytes_A, cudaMemcpyHostToDevice);
     cudaMemcpy(gpu_B, host_B, bytes_B, cudaMemcpyHostToDevice);
 
-    dim3 threads_per_block(TILE_SIZE / THREAD_COLS, TILE_SIZE / THREAD_ROWS);
-    dim3 num_blocks((N + TILE_SIZE - 1) / TILE_SIZE, (M + TILE_SIZE - 1) / TILE_SIZE);
+    dim3 naive_num_blocks((N + 32 - 1) / 32, (M + 32 - 1) / 32);
+    dim3 tiled_num_blocks((N + TILE_SIZE - 1) / TILE_SIZE, (M + TILE_SIZE - 1) / TILE_SIZE);
+
+    dim3 naive_threads_per_block(32, 32);
+    dim3 tiled_threads_per_block(TILE_SIZE / THREAD_COLS, TILE_SIZE / THREAD_ROWS);
 
     // prep for benchmarking
     cudaEvent_t start, stop;
@@ -193,14 +216,14 @@ int main() {
     // BENCHMARK THE NAIVE VERSION
 
     for (int i = 0; i < warmup; ++i) {
-        sgemm_naive<<<num_blocks, threads_per_block>>>(M, K, N, gpu_A, gpu_B, gpu_C);
+        sgemm_naive<<<naive_num_blocks, naive_threads_per_block>>>(M, K, N, gpu_A, gpu_B, gpu_C);
     }
     cudaDeviceSynchronize();
     std::cout << "CUDA Error: " << cudaGetErrorString(cudaGetLastError()) << std::endl;
 
     cudaEventRecord(start);
     for (int i = 0; i < runs; ++i) {
-        sgemm_naive<<<num_blocks, threads_per_block>>>(M, K, N, gpu_A, gpu_B, gpu_C);
+        sgemm_naive<<<naive_num_blocks, naive_threads_per_block>>>(M, K, N, gpu_A, gpu_B, gpu_C);
     }
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
@@ -214,14 +237,14 @@ int main() {
     // BENCHMARK THE TILED KERNEL
 
     for (int i = 0; i < warmup; ++i) {
-        sgemm_tiled<<<num_blocks, threads_per_block>>>(M, K, N, gpu_A, gpu_B, gpu_C);
+        sgemm_tiled<<<tiled_num_blocks, tiled_threads_per_block>>>(M, K, N, gpu_A, gpu_B, gpu_C);
     }
     cudaDeviceSynchronize();
     std::cout << "CUDA Error: " << cudaGetErrorString(cudaGetLastError()) << std::endl;
 
     cudaEventRecord(start);
     for (int i = 0; i < runs; ++i) {
-        sgemm_tiled<<<num_blocks, threads_per_block>>>(M, K, N, gpu_A, gpu_B, gpu_C);
+        sgemm_tiled<<<tiled_num_blocks, tiled_threads_per_block>>>(M, K, N, gpu_A, gpu_B, gpu_C);
     }
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
