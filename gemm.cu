@@ -22,82 +22,97 @@ __global__ void sgemm_naive(int M, int K, int N, float* p_A, float* p_B, float* 
     }
 }
 
-#define TILE_SIZE 64 // must be known at compile 
-#define THREAD_ROWS 4
-#define THREAD_COLS 4
+#define TILE_ROWS 128
+#define TILE_COLS 128
+#define K_DEPTH 8
+#define THREAD_ROWS 8
+#define THREAD_COLS 8
 #define VECTORIZED_LOAD 4
 // launches one thread for [THREAD_ROW, THREAD_COL] patch of output
 // (TILE_SIZE * TILE_SIZE) / (THREAD_ROWS * THREAD_COLS) threads per patch
-#define THREADS_PER_TILE (TILE_SIZE * TILE_SIZE) / (THREAD_ROWS * THREAD_COLS)
+#define THREADS_PER_TILE (TILE_ROWS * TILE_COLS) / (THREAD_ROWS * THREAD_COLS)
 
 // the big ass 16x1024 or 1024x16 is chopped into 16x16 tiles that are sliding across K (since to calculate elems you go over whole K)
 __global__ void sgemm_tiled(int M, int K, int N, float* p_A, float* p_B, float* p_C) {
-    __shared__ float tile_A[TILE_SIZE][TILE_SIZE];
-    __shared__ float tile_B[TILE_SIZE][TILE_SIZE];
+    __shared__ float tile_A[TILE_ROWS][K_DEPTH];
+    __shared__ float tile_B[K_DEPTH][TILE_COLS];
 
     float C_reg[THREAD_ROWS][THREAD_COLS] = {0.0f};
 
-    int total_phases = (K + TILE_SIZE - 1) / TILE_SIZE; // round it up
+    int flat_tid = threadIdx.y * blockDim.x + threadIdx.x;
+
+    int num_loads_A = TILE_ROWS * K_DEPTH / VECTORIZED_LOAD;
+    int loads_per_row_A = K_DEPTH / VECTORIZED_LOAD;
+
+    int num_loads_B = K_DEPTH * TILE_COLS / VECTORIZED_LOAD;
+    int loads_per_row_B = TILE_COLS / VECTORIZED_LOAD;
+
+    // TODO: load tile A and tile B, multiplication is already correct.
+
+    int total_phases = (K + K_DEPTH - 1) / K_DEPTH; // round it up
     for (int phase = 0; phase < total_phases; ++phase) {
-        int flat_tid = threadIdx.y * blockDim.x + threadIdx.x;
-        // load_idx is how many loads we perform - so elems divided by load size
-        // TILE SIZE MUST BE A MULTIPLE OF VECTORIZED_LOAD
-        for (int load_idx = flat_tid; load_idx < (TILE_SIZE * TILE_SIZE) / VECTORIZED_LOAD; load_idx += THREADS_PER_TILE) {
-            int start_elem_idx = load_idx * 4;
-            int tile_row = start_elem_idx / TILE_SIZE; // will get optimized to >>
-            int tile_col = start_elem_idx % TILE_SIZE; // will get optimized to &
 
-            int global_row_A = blockIdx.y * TILE_SIZE + tile_row;
-            int global_col_A = phase * TILE_SIZE + tile_col;
+        // LOAD A
 
-            // when u use xor swizzling on [A][B] u just do [A][B ^ A] everywhere
+        
+        for (int load_idx = flat_tid; load_idx < num_loads_A; load_idx += THREADS_PER_TILE) {
+            int start_elem_idx = load_idx * VECTORIZED_LOAD;
+            int local_row = start_elem_idx / K_DEPTH;
+            int local_col = start_elem_idx % K_DEPTH;
+
+            int global_row_A = blockIdx.y * TILE_ROWS + local_row;
+            int global_col_A = phase * K_DEPTH + local_col;
+
             if (global_row_A < M && global_col_A < K) {
-                // reinterpret as 4 float4 pieces, and take the first one [0]
                 float4 chunk_A = reinterpret_cast<float4*>(&p_A[global_row_A * K + global_col_A])[0];
-                tile_A[tile_row][(tile_col + 0) ^ tile_row] = chunk_A.x;
-                tile_A[tile_row][(tile_col + 1) ^ tile_row] = chunk_A.y;
-                tile_A[tile_row][(tile_col + 2) ^ tile_row] = chunk_A.z;
-                tile_A[tile_row][(tile_col + 3) ^ tile_row] = chunk_A.w;
+                tile_A[local_row][local_col + 0] = chunk_A.x;
+                tile_A[local_row][local_col + 1] = chunk_A.y;
+                tile_A[local_row][local_col + 2] = chunk_A.z;
+                tile_A[local_row][local_col + 3] = chunk_A.w;
             }
             else {
-                // if TILE_SIZE sticks out of M, N or K by not a multiple of 4, the result is wrong. So 32x32 tile on 33x33 matrix wont work.
-                tile_A[tile_row][(tile_col + 0) ^ tile_row] = 0.0f;
-                tile_A[tile_row][(tile_col + 1) ^ tile_row] = 0.0f;
-                tile_A[tile_row][(tile_col + 2) ^ tile_row] = 0.0f;
-                tile_A[tile_row][(tile_col + 3) ^ tile_row] = 0.0f;
+                tile_A[local_row][local_col + 0] = 0.0f;
+                tile_A[local_row][local_col + 1] = 0.0f;
+                tile_A[local_row][local_col + 2] = 0.0f;
+                tile_A[local_row][local_col + 3] = 0.0f;
             }
+        }
 
-            int global_row_B = phase * TILE_SIZE + tile_row;
-            int global_col_B = blockIdx.x * TILE_SIZE + tile_col;
+
+        // LOAD B
+        for (int load_idx = flat_tid; load_idx < num_loads_B; load_idx += THREADS_PER_TILE) {
+            int start_elem_idx = load_idx * VECTORIZED_LOAD;
+            int local_row = start_elem_idx / TILE_COLS;
+            int local_col = start_elem_idx % TILE_COLS;
+
+            int global_row_B = phase * K_DEPTH + local_row;
+            int global_col_B = blockIdx.x * TILE_COLS + local_col;
 
             if (global_row_B < K && global_col_B < N) {
                 float4 chunk_B = reinterpret_cast<float4*>(&p_B[global_row_B * N + global_col_B])[0];
-                tile_B[tile_row][(tile_col + 0) ^ tile_row] = chunk_B.x;
-                tile_B[tile_row][(tile_col + 1) ^ tile_row] = chunk_B.y;
-                tile_B[tile_row][(tile_col + 2) ^ tile_row] = chunk_B.z;
-                tile_B[tile_row][(tile_col + 3) ^ tile_row] = chunk_B.w;
+                tile_B[local_row][local_col + 0] = chunk_B.x;
+                tile_B[local_row][local_col + 1] = chunk_B.y;
+                tile_B[local_row][local_col + 2] = chunk_B.z;
+                tile_B[local_row][local_col + 3] = chunk_B.w;
             }
             else {
-                // same as A case
-                tile_B[tile_row][(tile_col + 0) ^ tile_row] = 0.0f;
-                tile_B[tile_row][(tile_col + 1) ^ tile_row] = 0.0f;
-                tile_B[tile_row][(tile_col + 2) ^ tile_row] = 0.0f;
-                tile_B[tile_row][(tile_col + 3) ^ tile_row] = 0.0f;
+                tile_B[local_row][local_col + 0] = 0.0f;
+                tile_B[local_row][local_col + 1] = 0.0f;
+                tile_B[local_row][local_col + 2] = 0.0f;
+                tile_B[local_row][local_col + 3] = 0.0f;
             }
         }
-        // now a and b are loaded up. TODO: tiled register and k loop
         __syncthreads(); // so its all filled up
 
         float A_reg[THREAD_ROWS];
         float B_reg[THREAD_COLS];
         
-
-        for (int k = 0; k < TILE_SIZE; ++k) {
+        for (int k = 0; k < K_DEPTH; ++k) {
             for (int i = 0; i < THREAD_ROWS; ++i) {
-                A_reg[i] = tile_A[threadIdx.y * THREAD_ROWS + i][k ^ (threadIdx.y * THREAD_ROWS + i)];
+                A_reg[i] = tile_A[threadIdx.y * THREAD_ROWS + i][k];
             }
             for (int j = 0; j < THREAD_COLS; ++j) {
-                B_reg[j] = tile_B[k][(threadIdx.x * THREAD_COLS + j) ^ k];
+                B_reg[j] = tile_B[k][(threadIdx.x * THREAD_COLS + j)];
             }
             for (int i = 0; i < THREAD_ROWS; ++i) {
                 for (int j = 0; j < THREAD_COLS; ++j) {
@@ -110,8 +125,8 @@ __global__ void sgemm_tiled(int M, int K, int N, float* p_A, float* p_B, float* 
         __syncthreads();
     }
     
-    int start_global_row_C = blockIdx.y * TILE_SIZE + threadIdx.y * THREAD_ROWS;
-    int start_global_col_C = blockIdx.x * TILE_SIZE + threadIdx.x * THREAD_COLS;
+    int start_global_row_C = blockIdx.y * TILE_ROWS + threadIdx.y * THREAD_ROWS;
+    int start_global_col_C = blockIdx.x * TILE_COLS + threadIdx.x * THREAD_COLS;
 
     for (int i = 0; i < THREAD_ROWS; i++) {
         for (int j = 0; j < THREAD_COLS; j++) {
@@ -198,10 +213,10 @@ int main() {
     cudaMemcpy(gpu_B, host_B, bytes_B, cudaMemcpyHostToDevice);
 
     dim3 naive_num_blocks((N + 32 - 1) / 32, (M + 32 - 1) / 32);
-    dim3 tiled_num_blocks((N + TILE_SIZE - 1) / TILE_SIZE, (M + TILE_SIZE - 1) / TILE_SIZE);
+    dim3 tiled_num_blocks((N + TILE_COLS - 1) / TILE_COLS, (M + TILE_ROWS - 1) / TILE_ROWS);
 
     dim3 naive_threads_per_block(32, 32);
-    dim3 tiled_threads_per_block(TILE_SIZE / THREAD_COLS, TILE_SIZE / THREAD_ROWS);
+    dim3 tiled_threads_per_block(TILE_COLS / THREAD_COLS, TILE_ROWS / THREAD_ROWS);
 
     // prep for benchmarking
     cudaEvent_t start, stop;
